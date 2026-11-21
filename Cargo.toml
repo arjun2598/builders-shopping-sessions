@@ -1,0 +1,22 @@
+[package]
+name = "shopsess"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rayon = "1.10"
+memmap2 = "0.9"
+memchr = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+arrow-array = "53"
+arrow-schema = "53"
+parquet = { version = "53", default-features = false, features = ["arrow"] }
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
