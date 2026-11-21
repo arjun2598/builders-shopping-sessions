@@ -16,7 +16,15 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
-const NB: usize = 256;
+static NBITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(8);
+#[inline(always)]
+fn nbits() -> u32 {
+    NBITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[inline(always)]
+fn nb() -> usize {
+    1usize << nbits()
+}
 const CHUNK: usize = 4 << 20;
 const BAD: u8 = 255;
 
@@ -233,9 +241,12 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     v.sort();
     v
 }
-fn map_files(paths: &[PathBuf]) -> Vec<Mmap> {
-    paths
-        .iter()
+/// Map every input file; unless INPUT=mmap, also fault all pages in up front, in 16 MB ranges
+/// spread over all threads (one madvise each). Measured best with both a hot and a cold page
+/// cache, and unlike per-file MAP_POPULATE it doesn't serialise on one large file.
+fn map_files(paths: &[PathBuf], populate: bool) -> Vec<Mmap> {
+    let v: Vec<Mmap> = paths
+        .par_iter()
         .filter_map(|p| {
             let f = File::open(p).ok()?;
             if f.metadata().ok()?.len() == 0 {
@@ -246,7 +257,24 @@ fn map_files(paths: &[PathBuf]) -> Vec<Mmap> {
             let _ = m.advise(memmap2::Advice::Sequential);
             Some(m)
         })
-        .collect()
+        .collect();
+    #[cfg(target_os = "linux")]
+    if populate {
+        const R: usize = 16 << 20;
+        let ranges: Vec<(usize, usize)> = v
+            .iter()
+            .flat_map(|m| {
+                let (a, n) = (m.as_ptr() as usize, m.len());
+                (0..n.div_ceil(R)).map(move |i| (a + i * R, R.min(n - i * R)))
+            })
+            .collect();
+        ranges.par_iter().for_each(|&(a, n)| unsafe {
+            libc::madvise(a as *mut libc::c_void, n, libc::MADV_POPULATE_READ);
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = populate;
+    v
 }
 /// Body of each file (header removed) split into ~CHUNK pieces at line boundaries.
 fn chunks<'a>(maps: &'a [Mmap]) -> Vec<&'a [u8]> {
@@ -506,7 +534,7 @@ fn find(p: &mut [u32], mut x: u32) -> u32 {
 }
 
 fn transpose<T>(parts: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
-    let mut out: Vec<Vec<Vec<T>>> = (0..NB).map(|_| Vec::with_capacity(parts.len())).collect();
+    let mut out: Vec<Vec<Vec<T>>> = (0..nb()).map(|_| Vec::with_capacity(parts.len())).collect();
     for p in parts {
         for (b, v) in p.into_iter().enumerate() {
             if !v.is_empty() {
@@ -518,11 +546,11 @@ fn transpose<T>(parts: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
 }
 /// NB bucket vectors pre-sized for ~n records spread evenly (+25% and a little slack).
 fn reserved_buckets<T>(n: usize) -> Vec<Vec<T>> {
-    let c = n / NB + n / NB / 4 + 16;
-    (0..NB).map(|_| Vec::with_capacity(c)).collect()
+    let c = n / nb() + n / nb() / 4 + 16;
+    (0..nb()).map(|_| Vec::with_capacity(c)).collect()
 }
 fn empty_buckets<T>() -> Vec<Vec<T>> {
-    (0..NB).map(|_| Vec::new()).collect()
+    (0..nb()).map(|_| Vec::new()).collect()
 }
 
 fn json_str<'a>(s: &'a str, key: &str) -> &'a str {
@@ -540,6 +568,13 @@ fn main() {
     for _ in 0..reps {
         run(ncpu);
     }
+    if std::env::var("STATS").is_ok() {
+        // Linux: minor faults, utime, stime (clock ticks) from /proc/self/stat
+        if let Ok(st) = std::fs::read_to_string("/proc/self/stat") {
+            let f: Vec<&str> = st.rsplit(')').next().unwrap_or("").split_whitespace().collect();
+            eprintln!("stats: minflt {} majflt {} utime {} stime {} (ticks)", f[7], f[9], f[11], f[12]);
+        }
+    }
     std::process::exit(0);
 }
 
@@ -550,7 +585,6 @@ fn run(ncpu: usize) {
         args.get(args.len().wrapping_sub(2)).cloned().unwrap_or("/data".into())
     }));
     let outdir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
-    let use_radix = std::env::var("RADIX").map(|v| v != "0").unwrap_or(true);
     let lap = |s: &str| eprintln!("[{:>8.3}s] {}", t0.elapsed().as_secs_f64(), s);
 
     // manifest
@@ -606,9 +640,22 @@ fn run(ncpu: usize) {
     let organic = ncamp as u32;
 
     let ing0 = ws.div_euclid(1000) - (1i64 << 31);
-    let ev_maps = map_files(&list_csv(&data.join("events")));
-    let ck_maps = map_files(&list_csv(&data.join("clicks")));
-    let lk_maps = map_files(&list_csv(&data.join("links")));
+    let pop = std::env::var("INPUT").map(|v| v != "mmap").unwrap_or(true);
+    let ev_maps = map_files(&list_csv(&data.join("events")), pop);
+    let ck_maps = map_files(&list_csv(&data.join("clicks")), pop);
+    let lk_maps = map_files(&list_csv(&data.join("links")), pop);
+    // bucket count scales with input so each bucket's working set stays cache-sized
+    let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
+    let est_rows = ev_bytes / 85;
+    // ~64K rows per bucket (bigger hurts dedup's cache use, smaller costs scatter streams),
+    // but at least 8 buckets per thread so the per-bucket phases stay load-balanced
+    let want = (est_rows >> 16).max(8 * rayon::current_num_threads()).max(1);
+    let auto_bits = want.next_power_of_two().trailing_zeros().clamp(4, 11);
+    let sh: u32 = std::env::var("NBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(auto_bits).clamp(1, 11);
+    NBITS.store(sh, std::sync::atomic::Ordering::Relaxed);
+    if std::env::var_os("STATS").is_some() {
+        eprintln!("nbits={} est_rows={}", sh, est_rows);
+    }
     lap("setup");
 
     let build_links = || {
@@ -684,7 +731,7 @@ fn run(ncpu: usize) {
                     if uid.len() >= 1 << 24 {
                         typ = BAD;
                     }
-                    acc[(h >> 120) as usize].push(Ev {
+                    acc[(h >> (128 - sh)) as usize].push(Ev {
                         e0: (h >> 64) as u64,
                         e1: h as u64,
                         uh: if typ != BAD { xxh3_64(uid) } else { 0 },
@@ -734,7 +781,7 @@ fn run(ncpu: usize) {
                         }
                         let (h, mut c) = flat[i];
                         c.pkey = persons.get(h, &[]).0;
-                        acc[(c.pkey >> 56) as usize].push(c);
+                        acc[(c.pkey >> (64 - sh)) as usize].push(c);
                     }
                     acc
                 })
@@ -751,55 +798,52 @@ fn run(ncpu: usize) {
     let sv_parts: Vec<Vec<Vec<Sv>>> = ev_b
         .into_par_iter()
         .map(|vs| {
-            // sort 16-byte keys (e0, location) instead of moving whole records
+            let mut out: Vec<Vec<Sv>> = empty_buckets();
+            let mut surv: Vec<&Ev> = Vec::new();
+            // hash dedup: open-addressing table of (e0, location); a duplicate (same e0 and e1)
+            // keeps the smaller ingest_ts (equal ones are identical copies), the other is marked dead
             let total: usize = vs.iter().map(|v| v.len()).sum();
-            let mut keys: Vec<(u64, u64)> = Vec::with_capacity(total);
+            let cap = (total * 2).next_power_of_two().max(16);
+            let mask = cap - 1;
+            let mut tab: Vec<(u64, u64)> = vec![(0, u64::MAX); cap];
+            let mut dead: Vec<Vec<u64>> = vs.iter().map(|v| vec![0u64; v.len().div_ceil(64)]).collect();
             for (pi, part) in vs.iter().enumerate() {
                 for (ei, e) in part.iter().enumerate() {
-                    keys.push((e.e0, ((pi as u64) << 32) | ei as u64));
+                    let loc = ((pi as u64) << 32) | ei as u64;
+                    // the bucket came from the top bits of e0; probe on bits below them
+                    let mut i = ((e.e0 >> 20) as usize) & mask;
+                    loop {
+                        let (k, l) = tab[i];
+                        if l == u64::MAX {
+                            tab[i] = (e.e0, loc);
+                            break;
+                        }
+                        if k == e.e0 {
+                            let o = &vs[(l >> 32) as usize][(l & 0xffff_ffff) as usize];
+                            if o.e1 == e.e1 {
+                                let (dp, di) = if e.ing < o.ing {
+                                    tab[i].1 = loc;
+                                    (l >> 32, l & 0xffff_ffff)
+                                } else {
+                                    (pi as u64, ei as u64)
+                                };
+                                dead[dp as usize][(di >> 6) as usize] |= 1u64 << (di & 63);
+                                break;
+                            }
+                        }
+                        i = (i + 1) & mask;
+                    }
                 }
             }
-            let low = |k: u64| k & ((1u64 << 33) - 1);
-            if use_radix {
-                radix33(&mut keys);
-            } else {
-                keys.sort_unstable_by_key(|k| low(k.0));
-            }
-            let at = |loc: u64| &vs[(loc >> 32) as usize][(loc & 0xffff_ffff) as usize];
-            let mut out: Vec<Vec<Sv>> = empty_buckets();
-            let mut surv: Vec<&Ev> = Vec::with_capacity(keys.len());
-            macro_rules! emit {
-                ($e:expr) => {{
-                    let e: &Ev = $e;
-                    if e.typ() != BAD {
+            drop(tab);
+            surv.reserve(total);
+            for (pi, part) in vs.iter().enumerate() {
+                let dm = &dead[pi];
+                for (ei, e) in part.iter().enumerate() {
+                    if (dm[ei >> 6] >> (ei & 63)) & 1 == 0 && e.typ() != BAD {
                         surv.push(e);
                     }
-                }};
-            }
-            let mut grp: Vec<&Ev> = vec![];
-            let mut i = 0;
-            while i < keys.len() {
-                let mut j = i + 1;
-                while j < keys.len() && low(keys[j].0) == low(keys[i].0) {
-                    j += 1;
                 }
-                if j == i + 1 {
-                    emit!(at(keys[i].1));
-                } else {
-                    grp.clear();
-                    grp.extend(keys[i..j].iter().map(|k| at(k.1)));
-                    grp.sort_unstable_by_key(|e| (e.e0, e.e1, e.ing));
-                    let mut a = 0;
-                    while a < grp.len() {
-                        let mut b = a + 1;
-                        while b < grp.len() && grp[b].e0 == grp[a].e0 && grp[b].e1 == grp[a].e1 {
-                            b += 1;
-                        }
-                        emit!(grp[a]);
-                        a = b;
-                    }
-                }
-                i = j;
             }
             for i in 0..surv.len() {
                 if i + PF < surv.len() {
@@ -807,7 +851,7 @@ fn run(ncpu: usize) {
                 }
                 let e = surv[i];
                 let (pkey, name) = persons.get(e.uh, e.uid());
-                out[(pkey >> 56) as usize].push(Sv {
+                out[(pkey >> (64 - sh)) as usize].push(Sv {
                     pkey,
                     ts: ws + e.ts as i64,
                     np: name.as_ptr(),
@@ -1075,7 +1119,7 @@ fn write_users(path: &Path, parts: &[&[URow]], cats: &[&[u8]]) {
         Arc::new(tops.finish()),
     ];
     let batch = RecordBatch::try_new(schema.clone(), cols).unwrap();
-    let f = File::create(path).unwrap();
+    let f = std::io::BufWriter::with_capacity(8 << 20, File::create(path).unwrap());
     let mut w = ArrowWriter::try_new(f, schema, Some(props())).unwrap();
     w.write(&batch).unwrap();
     w.close().unwrap();
@@ -1101,7 +1145,7 @@ fn write_campaigns(path: &Path, rows: &[(&[u8], &[u8], i32, [i64; 4])]) {
         Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3[3]))),
     ];
     let batch = RecordBatch::try_new(schema.clone(), cols).unwrap();
-    let f = File::create(path).unwrap();
+    let f = std::io::BufWriter::with_capacity(8 << 20, File::create(path).unwrap());
     let mut w = ArrowWriter::try_new(f, schema, Some(props())).unwrap();
     w.write(&batch).unwrap();
     w.close().unwrap();
@@ -1110,52 +1154,6 @@ fn write_campaigns(path: &Path, rows: &[(&[u8], &[u8], i32, [i64; 4])]) {
 #[inline]
 fn lines(d: &[u8]) -> Lines<'_> {
     Lines { d }
-}
-
-/// LSD radix sort of (key, payload) pairs on the low 33 bits of key (3 passes of 11 bits).
-/// Equal low-33 keys end up adjacent; callers compare full keys within such runs.
-fn radix33(a: &mut Vec<(u64, u64)>) {
-    radix_bits(a, 3)
-}
-
-/// LSD radix on the low 11*passes bits of key.
-fn radix_bits(a: &mut Vec<(u64, u64)>, passes: usize) {
-    const B: usize = 11;
-    const R: usize = 1 << B;
-    const M: u64 = (R - 1) as u64;
-    let n = a.len();
-    let mask = if passes * B >= 64 { u64::MAX } else { (1u64 << (passes * B)) - 1 };
-    if n < 256 {
-        a.sort_unstable_by_key(|k| k.0 & mask);
-        return;
-    }
-    let mut h = vec![[0u32; R]; passes];
-    for k in a.iter() {
-        for (p, hp) in h.iter_mut().enumerate() {
-            hp[((k.0 >> (p * B)) & M) as usize] += 1;
-        }
-    }
-    for hp in h.iter_mut() {
-        let mut sum = 0u32;
-        for c in hp.iter_mut() {
-            let t = *c;
-            *c = sum;
-            sum += t;
-        }
-    }
-    let mut buf: Vec<(u64, u64)> = Vec::with_capacity(n);
-    unsafe { buf.set_len(n) };
-    let (mut src, mut dst) = (std::mem::take(a), buf);
-    for (p, hp) in h.iter_mut().enumerate() {
-        let sh = p * B;
-        for k in src.iter() {
-            let d = ((k.0 >> sh) & M) as usize;
-            unsafe { *dst.get_unchecked_mut(hp[d] as usize) = *k };
-            hp[d] += 1;
-        }
-        std::mem::swap(&mut src, &mut dst);
-    }
-    *a = src;
 }
 
 /// u128 sort key equivalent to (pord(pk), ts) when ts - base fits in 31 bits.
@@ -1174,7 +1172,21 @@ fn pord(pk: u64) -> (u64, u64) {
 /// Bitmasks of ',' '\n' '"' for a 64-byte block (bit i = byte i).
 #[inline(always)]
 fn block_masks(b: &[u8; 64]) -> (u64, u64, u64) {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let c = _mm256_set1_epi8(b',' as i8);
+        let n = _mm256_set1_epi8(b'\n' as i8);
+        let q = _mm256_set1_epi8(b'"' as i8);
+        let v0 = _mm256_loadu_si256(b.as_ptr() as *const __m256i);
+        let v1 = _mm256_loadu_si256(b.as_ptr().add(32) as *const __m256i);
+        let mm = |x: __m256i, y: __m256i| -> u64 {
+            (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, x)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, y)) as u32 as u64) << 32)
+        };
+        return (mm(c, c), mm(n, n), mm(q, q));
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     unsafe {
         use std::arch::x86_64::*;
         let c = _mm_set1_epi8(b',' as i8);
@@ -1223,92 +1235,107 @@ fn block_masks(b: &[u8; 64]) -> (u64, u64, u64) {
     }
 }
 
-/// Slow path for one field: strip a whole-field quote pair; None if any other quote.
-#[inline(never)]
-fn unq(f: &[u8]) -> Option<&[u8]> {
-    if memchr(b'"', f).is_none() {
-        return Some(f);
-    }
-    let n = f.len();
-    if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' && memchr(b'"', &f[1..n - 1]).is_none() {
-        Some(&f[1..n - 1])
-    } else {
-        None
-    }
-}
-
 /// Calls f for every well-formed line of exactly N fields (quotes stripped), per the CSV dialect.
-/// Quote validity per field is a bitmask test over a 128-bit window of the last two blocks' quote bits.
+///
+/// Quote rules are checked for a whole 64-byte block at once. With S = separators (',' '\n',
+/// plus a virtual line end at the end of data), B = field-start and E = field-end positions:
+/// a quote is legal only at exactly one of B/E (`bad`), an opening quote (q&B) needs a closing
+/// quote (q&E) in the same field. "Which field's separator follows bit x" is found by adding x
+/// to !S: the carry runs through the field and lands on its separator. Per field this leaves
+/// two bit tests (bad field, quoted field), with no length limit and no slow path.
 #[inline(always)]
 fn for_each_row<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(d: &'a [u8], mut f: F) {
     assert!(N <= 7);
     let len = d.len();
+    if len == 0 {
+        return;
+    }
     let dp = d.as_ptr();
+    let virt = d[len - 1] != b'\n';
+    let nblk = if virt { len / 64 + 1 } else { len.div_ceil(64) };
+    let load = |k: usize| -> (u64, u64, u64) {
+        let base = k * 64;
+        let (cm, mut nm, qm) = if base + 64 <= len {
+            block_masks(unsafe { &*(dp.add(base) as *const [u8; 64]) })
+        } else {
+            let mut tmp = [0u8; 64];
+            if base < len {
+                tmp[..len - base].copy_from_slice(&d[base..]);
+            }
+            block_masks(&tmp)
+        };
+        if virt && len >= base && len < base + 64 {
+            nm |= 1u64 << (len - base);
+        }
+        (cm, nm, qm)
+    };
+    let sl = |a: usize, b: usize| -> &'a [u8] { unsafe { std::slice::from_raw_parts(dp.add(a), b - a) } };
     let mut fields: [&'a [u8]; 8] = [&[]; 8];
     let mut nf = 0usize;
-    let mut bad = false;
+    let mut bad = 0u64;
     let mut fs = 0usize;
-    let mut base = 0usize;
-    let mut qprev: u64 = 0;
-    let mut tmp: [u8; 64];
-    let sl = |a: usize, b: usize| -> &'a [u8] { unsafe { std::slice::from_raw_parts(dp.add(a), b - a) } };
-    while base < len {
-        let blk: &[u8; 64] = if base + 64 <= len {
-            unsafe { &*(dp.add(base) as *const [u8; 64]) }
-        } else {
-            tmp = [0u8; 64];
-            tmp[..len - base].copy_from_slice(&d[base..]);
-            &tmp
-        };
-        let (cm, nm, qm) = block_masks(blk);
-        let win: u128 = ((qm as u128) << 64) | qprev as u128;
-        let mut s = cm | nm;
-        while s != 0 {
-            let i = s.trailing_zeros() as usize;
+    let (mut cm, mut nm, mut qm) = load(0);
+    let mut s_top = 1u64; // the data start acts as a separator before byte 0
+    let mut c_top = 0u64; // closing quote at byte 63 of the previous block
+    let mut cy_bad = 0u64;
+    let mut cy_open = 0u64;
+    for k in 0..nblk {
+        let base = k * 64;
+        let (ncm, nnm, nqm) = if k + 1 < nblk { load(k + 1) } else { (0, 0, 0) };
+        let s = cm | nm;
+        let b = (s << 1) | s_top;
+        let e = (s >> 1) | (((ncm | nnm) & 1) << 63);
+        let bq = qm & !(b ^ e);
+        let open = qm & b & !e;
+        let close = qm & e & !b;
+        let z = !s;
+        let (r1, o1) = z.overflowing_add(bq);
+        let (r1, o1b) = r1.overflowing_add(cy_bad);
+        cy_bad = (o1 | o1b) as u64;
+        let (r2, o2) = z.overflowing_add(open);
+        let (r2, o2b) = r2.overflowing_add(cy_open);
+        cy_open = (o2 | o2b) as u64;
+        let csep = ((close << 1) | c_top) & s; // separators of fields with a closing quote
+        let fbad = (r1 & s) | ((r2 & s) ^ csep);
+        let mut sm = s;
+        while sm != 0 {
+            let i = sm.trailing_zeros() as usize;
             let p = base + i;
-            let l = p - fs;
-            if fs + 64 >= base && l <= 64 {
-                // branch-free: qd = field has quotes; ok = exactly a quote at each end (len >= 2)
-                let off = fs + 64 - base;
-                let m = if l == 64 { u64::MAX } else { (1u64 << l) - 1 };
-                let qb = (win >> off) as u64 & m;
-                let pat = 1u64 | (1u64 << (l.wrapping_sub(1) & 63));
-                let qd = (qb != 0) as usize;
-                let ok = (qb == pat) & (l >= 2);
-                bad |= (qd != 0) & !ok;
-                let st = fs + qd;
-                let en = (p - qd).max(st);
-                fields[nf.min(7)] = sl(st, en);
-            } else {
-                match unq(sl(fs, p)) {
-                    Some(x) => fields[nf.min(7)] = x,
-                    None => bad = true,
-                }
-            }
+            let qd = ((csep >> i) & 1) as usize;
+            bad |= fbad >> i;
+            let st = fs + qd;
+            let en = (p - qd).max(st);
+            fields[nf.min(7)] = sl(st, en);
             nf += 1;
             if (nm >> i) & 1 != 0 {
-                if !bad && nf == N {
+                if bad & 1 == 0 && nf == N {
                     f(unsafe { &*(fields.as_ptr() as *const [&'a [u8]; N]) });
                 }
                 nf = 0;
-                bad = false;
+                bad = 0;
             }
             fs = p + 1;
-            s &= s - 1;
+            sm &= sm - 1;
         }
-        qprev = qm;
-        base += 64;
+        s_top = s >> 63;
+        c_top = close >> 63;
+        (cm, nm, qm) = (ncm, nnm, nqm);
     }
-    if fs < len || nf > 0 {
-        match unq(sl(fs, len)) {
-            Some(x) => fields[nf.min(7)] = x,
-            None => bad = true,
-        }
-        nf += 1;
-        if !bad && nf == N {
-            f(unsafe { &*(fields.as_ptr() as *const [&'a [u8]; N]) });
-        }
-    }
+}
+
+/// All 8 bytes are ASCII '0'..='9'.
+#[inline(always)]
+fn all_digits8(v: u64) -> bool {
+    (v & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
+        && (((v & 0x0F0F_0F0F_0F0F_0F0F) + 0x0606_0606_0606_0606) & 0x1010_1010_1010_1010) == 0
+}
+/// Value of 8 ASCII digits (first digit in the lowest byte), already validated.
+#[inline(always)]
+fn digits8(v: u64) -> u64 {
+    let v = v & 0x0F0F_0F0F_0F0F_0F0F;
+    let v = (v * 10 + (v >> 8)) & 0x00FF_00FF_00FF_00FF; // 4 two-digit values
+    let v = (v * 100 + (v >> 16)) & 0x0000_FFFF_0000_FFFF; // 2 four-digit values
+    (v * 10_000 + (v >> 32)) & 0xFFFF_FFFF
 }
 
 /// Per-thread cache of validated dates: "YYYY-MM-DD" -> day number (or invalid).
@@ -1345,12 +1372,22 @@ impl DateCache {
     }
     #[inline(always)]
     fn dt(&mut self, b: &[u8]) -> Option<i64> {
-        if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        // b.len() >= 20. "HH:MM:SS" (b[11..19]) validated and decoded as one u64 (SWAR).
+        const M: u64 = 0xFFFF_00FF_FF00_FFFF; // digit bytes 0,1,3,4,6,7
+        const COL: u64 = 0x0000_3A00_003A_0000; // ':' at bytes 2 and 5
+        let t = u64::from_le_bytes(b[11..19].try_into().unwrap());
+        let lo = t & 0x0F0F_0F0F_0F0F_0F0F & M;
+        let digits = (t & M & 0xF0F0_F0F0_F0F0_F0F0) == (0x3030_3030_3030_3030 & M)
+            && ((lo + 0x0606_0606_0606_0606) & 0x1010_1010_1010_1010) == 0;
+        let sep = (b[4] ^ b'-') | (b[7] ^ b'-') | (b[10] ^ b'T');
+        if sep != 0 || (t & !M) != COL || !digits {
             return None;
         }
-        let hh = d2(b, 11)?;
-        let mi = d2(b, 14)?;
-        let s = d2(b, 17)?;
+        // byte k of u = 10*digit_k + digit_{k+1} (no carries: <= 99)
+        let u = lo * 10 + (lo >> 8);
+        let hh = (u & 0xFF) as i64;
+        let mi = ((u >> 24) & 0xFF) as i64;
+        let s = ((u >> 48) & 0xFF) as i64;
         if hh > 23 || mi > 59 || s > 59 {
             return None;
         }
@@ -1371,7 +1408,19 @@ impl DateCache {
                 let off = (oh * 60 + om) * 60_000;
                 Some(if b[19] == b'+' { base - off } else { base + off })
             }
-            1..=18 => {
+            1..=16 => {
+                // F3 epoch ms: right-align in a '0'-padded 16-byte buffer, validate and
+                // decode both 8-byte halves with SWAR (leading zeros don't change the value)
+                let mut buf = [b'0'; 16];
+                buf[16 - b.len()..].copy_from_slice(b);
+                let hi = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+                let lo = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+                if !all_digits8(hi) || !all_digits8(lo) {
+                    return None;
+                }
+                Some((digits8(hi) * 100_000_000 + digits8(lo)) as i64)
+            }
+            17..=18 => {
                 let mut v: i64 = 0;
                 for &c in b {
                     let x = c.wrapping_sub(b'0');
@@ -1454,3 +1503,173 @@ fn psort<T: Copy, P: Fn(&T) -> u64, C: Fn(&T, &T) -> std::cmp::Ordering, K: Fn(&
 }
 
 
+
+#[cfg(test)]
+mod swar_tests {
+    use super::*;
+    #[test]
+    fn date_cache_matches_parse_ts_on_mutations() {
+        let mut seeds: Vec<String> = (1..=18).map(|l| "918273645546372819"[..l].to_string()).collect();
+        seeds.extend(["2027-12-19T18:13:05Z", "2027-02-28T23:59:59Z", "2028-02-29T00:00:00Z", "2027-12-19T09:07:00+05:30", "2027-01-01T00:00:00-23:59", "1829024243000", "0001829024243000", "9999999999999999", "99999999999999999", "123456789012345678", "0", "7", "86400000", "00000000000000000"].iter().map(|x| x.to_string()));
+        let mut n = 0;
+        for s in &seeds {
+            let base = s.as_bytes().to_vec();
+            for i in 0..base.len() {
+                for v in 0..=255u8 {
+                    let mut b = base.clone();
+                    b[i] = v;
+                    let mut dc = DateCache::new();
+                    // twice: cold miss, then cache hit
+                    assert_eq!(dc.parse(&b), parse_ts(&b), "{:?}", String::from_utf8_lossy(&b));
+                    assert_eq!(dc.parse(&b), parse_ts(&b), "{:?}", String::from_utf8_lossy(&b));
+                    n += 1;
+                }
+            }
+        }
+        assert!(n > 20_000);
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    /// Slow path for one field: strip a whole-field quote pair; None if any other quote.
+    fn unq(f: &[u8]) -> Option<&[u8]> {
+        if memchr(b'"', f).is_none() {
+            return Some(f);
+        }
+        let n = f.len();
+        if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' && memchr(b'"', &f[1..n - 1]).is_none() {
+            Some(&f[1..n - 1])
+        } else {
+            None
+        }
+    }
+
+    /// Calls f for every well-formed line of exactly N fields (quotes stripped), per the CSV dialect.
+    /// Quote validity per field is a bitmask test over a 128-bit window of the last two blocks' quote bits.
+    #[inline(always)]
+    fn for_each_row_old<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(d: &'a [u8], mut f: F) {
+        assert!(N <= 7);
+        let len = d.len();
+        let dp = d.as_ptr();
+        let mut fields: [&'a [u8]; 8] = [&[]; 8];
+        let mut nf = 0usize;
+        let mut bad = false;
+        let mut fs = 0usize;
+        let mut base = 0usize;
+        let mut qprev: u64 = 0;
+        let mut tmp: [u8; 64];
+        let sl = |a: usize, b: usize| -> &'a [u8] { unsafe { std::slice::from_raw_parts(dp.add(a), b - a) } };
+        while base < len {
+            let blk: &[u8; 64] = if base + 64 <= len {
+                unsafe { &*(dp.add(base) as *const [u8; 64]) }
+            } else {
+                tmp = [0u8; 64];
+                tmp[..len - base].copy_from_slice(&d[base..]);
+                &tmp
+            };
+            let (cm, nm, qm) = block_masks(blk);
+            let win: u128 = ((qm as u128) << 64) | qprev as u128;
+            let mut s = cm | nm;
+            while s != 0 {
+                let i = s.trailing_zeros() as usize;
+                let p = base + i;
+                let l = p - fs;
+                if fs + 64 >= base && l <= 64 {
+                    // branch-free: qd = field has quotes; ok = exactly a quote at each end (len >= 2)
+                    let off = fs + 64 - base;
+                    let m = if l == 64 { u64::MAX } else { (1u64 << l) - 1 };
+                    let qb = (win >> off) as u64 & m;
+                    let pat = 1u64 | (1u64 << (l.wrapping_sub(1) & 63));
+                    let qd = (qb != 0) as usize;
+                    let ok = (qb == pat) & (l >= 2);
+                    bad |= (qd != 0) & !ok;
+                    let st = fs + qd;
+                    let en = (p - qd).max(st);
+                    fields[nf.min(7)] = sl(st, en);
+                } else {
+                    match unq(sl(fs, p)) {
+                        Some(x) => fields[nf.min(7)] = x,
+                        None => bad = true,
+                    }
+                }
+                nf += 1;
+                if (nm >> i) & 1 != 0 {
+                    if !bad && nf == N {
+                        f(unsafe { &*(fields.as_ptr() as *const [&'a [u8]; N]) });
+                    }
+                    nf = 0;
+                    bad = false;
+                }
+                fs = p + 1;
+                s &= s - 1;
+            }
+            qprev = qm;
+            base += 64;
+        }
+        if fs < len || nf > 0 {
+            match unq(sl(fs, len)) {
+                Some(x) => fields[nf.min(7)] = x,
+                None => bad = true,
+            }
+            nf += 1;
+            if !bad && nf == N {
+                f(unsafe { &*(fields.as_ptr() as *const [&'a [u8]; N]) });
+            }
+        }
+    }
+
+
+    fn rows<const N: usize>(d: &[u8], old: bool) -> Vec<Vec<Vec<u8>>> {
+        let mut v = vec![];
+        if old {
+            for_each_row_old::<N, _>(d, |f| v.push(f.iter().map(|x| x.to_vec()).collect()));
+        } else {
+            for_each_row::<N, _>(d, |f| v.push(f.iter().map(|x| x.to_vec()).collect()));
+        }
+        v
+    }
+    #[test]
+    fn scanner_matches_reference_on_random_csv() {
+        let mut x: u64 = 0x1234_5678_9abc_def1;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alpha: &[u8] = b"ab\",\n\"\"x,\r ";
+        let (mut acc2, mut acc7, mut acc_long, mut acc_q) = (0usize, 0usize, 0usize, 0usize);
+        for it in 0..300_000 {
+            let n = (rnd() % if it % 10 == 0 { 400 } else { 90 }) as usize;
+            let quote_heavy = it % 3 == 0;
+            let mut d: Vec<u8> = (0..n)
+                .map(|_| {
+                    let r = rnd();
+                    if !quote_heavy && r % 4 != 0 { b'a' + (r >> 8) as u8 % 3 } else { alpha[(r >> 16) as usize % alpha.len()] }
+                })
+                .collect();
+            // sometimes long unquoted/quoted fields that cross block boundaries
+            if it % 7 == 0 {
+                let l = (rnd() % 150) as usize;
+                let at = if d.is_empty() { 0 } else { (rnd() as usize) % d.len() };
+                let mut fld = vec![b'"'];
+                fld.extend(std::iter::repeat(b'z').take(l));
+                fld.push(b'"');
+                d.splice(at..at, fld);
+            }
+            let r2 = rows::<2>(&d, false);
+            acc2 += r2.len();
+            acc_long += r2.iter().flatten().filter(|f| f.len() > 64).count();
+            acc_q += d.windows(2).filter(|w| w == b",\"").count();
+            acc7 += rows::<7>(&d, false).len();
+            assert_eq!(r2, rows::<2>(&d, true), "N=2 {:?}", String::from_utf8_lossy(&d));
+            assert_eq!(rows::<3>(&d, false), rows::<3>(&d, true), "N=3 {:?}", String::from_utf8_lossy(&d));
+            assert_eq!(rows::<4>(&d, false), rows::<4>(&d, true), "N=4 {:?}", String::from_utf8_lossy(&d));
+            assert_eq!(rows::<7>(&d, false), rows::<7>(&d, true), "N=7 {:?}", String::from_utf8_lossy(&d));
+        }
+        eprintln!("accepted rows: N=2 {acc2}, N=7 {acc7}; long fields {acc_long}; quoted-field starts {acc_q}");
+        assert!(acc2 > 10_000 && acc7 > 100 && acc_long > 100);
+    }
+}
