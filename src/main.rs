@@ -76,42 +76,38 @@ impl<'a> Iterator for Lines<'a> {
     }
 }
 
-#[inline]
-fn unquote(f: &[u8]) -> Option<&[u8]> {
-    if memchr(b'"', f).is_none() {
-        return Some(f);
-    }
-    let n = f.len();
-    if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' && memchr(b'"', &f[1..n - 1]).is_none() {
-        Some(&f[1..n - 1])
-    } else {
-        None
-    }
-}
-
 /// Split a line into exactly N fields; false if malformed.
 #[inline]
 fn split_fields<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> bool {
-    let len = line.len();
-    let mut start = 0;
+    // One pass: find commas; a field containing a quote must be exactly "...".
     let mut n = 0;
-    loop {
-        let end = match memchr(b',', &line[start..]) {
-            Some(p) => start + p,
-            None => len,
-        };
-        if n >= N {
-            return false;
+    let mut start = 0;
+    let mut quoted = false;
+    let mut i = 0;
+    let len = line.len();
+    while i <= len {
+        let c = if i < len { line[i] } else { b',' };
+        if c == b',' {
+            if n >= N {
+                return false;
+            }
+            let f = &line[start..i];
+            out[n] = if quoted {
+                let m = f.len();
+                if m < 2 || f[0] != b'"' || f[m - 1] != b'"' || f[1..m - 1].contains(&b'"') {
+                    return false;
+                }
+                &f[1..m - 1]
+            } else {
+                f
+            };
+            n += 1;
+            start = i + 1;
+            quoted = false;
+        } else if c == b'"' {
+            quoted = true;
         }
-        match unquote(&line[start..end]) {
-            Some(v) => out[n] = v,
-            None => return false,
-        }
-        n += 1;
-        if end == len {
-            break;
-        }
-        start = end + 1;
+        i += 1;
     }
     n == N
 }
@@ -431,60 +427,123 @@ fn main() {
     let lk_maps = map_files(&list_csv(&data.join("links")));
     lap("setup");
 
-    // ---------- links ----------
-    let lk_chunks = chunks(&lk_maps);
-    let pairs: Vec<Vec<(&[u8], &[u8])>> = lk_chunks
-        .par_iter()
-        .map(|ch| {
-            let mut v = vec![];
-            for l in lines(ch) {
-                let mut f = [&b""[..]; 2];
-                if split_fields(l, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
-                    v.push((f[0], f[1]));
+    let build_links = || {
+        // ---------- links ----------
+        let lk_chunks = chunks(&lk_maps);
+        let pairs: Vec<Vec<(&[u8], &[u8])>> = lk_chunks
+            .par_iter()
+            .map(|ch| {
+                let mut v = vec![];
+                for l in lines(ch) {
+                    let mut f = [&b""[..]; 2];
+                    if split_fields(l, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
+                        v.push((f[0], f[1]));
+                    }
+                }
+                v
+            })
+            .collect();
+        let mut map: IdMap<u32> = IdMap::default();
+        let mut ids: Vec<&[u8]> = vec![];
+        let mut parent: Vec<u32> = vec![];
+        for v in &pairs {
+            for &(a, b) in v {
+                let mut get = |s| -> u32 {
+                    let h = xxh3_64(s);
+                    *map.entry(h).or_insert_with(|| {
+                        ids.push(s);
+                        parent.push(parent.len() as u32);
+                        (ids.len() - 1) as u32
+                    })
+                };
+                let ia = get(a);
+                let ib = get(b);
+                let ra = find(&mut parent, ia);
+                let rb = find(&mut parent, ib);
+                if ra != rb {
+                    parent[ra as usize] = rb;
                 }
             }
-            v
-        })
-        .collect();
-    let mut map: IdMap<u32> = IdMap::default();
-    let mut ids: Vec<&[u8]> = vec![];
-    let mut parent: Vec<u32> = vec![];
-    for v in &pairs {
-        for &(a, b) in v {
-            let mut get = |s| -> u32 {
-                let h = xxh3_64(s);
-                *map.entry(h).or_insert_with(|| {
-                    ids.push(s);
-                    parent.push(parent.len() as u32);
-                    (ids.len() - 1) as u32
-                })
-            };
-            let ia = get(a);
-            let ib = get(b);
-            let ra = find(&mut parent, ia);
-            let rb = find(&mut parent, ib);
-            if ra != rb {
-                parent[ra as usize] = rb;
+        }
+        let n = ids.len();
+        let mut rootname: Vec<u32> = (0..n as u32).collect(); // per root: index of min id
+        for i in 0..n as u32 {
+            let r = find(&mut parent, i);
+            if ids[i as usize] < ids[rootname[r as usize] as usize] {
+                rootname[r as usize] = i;
             }
         }
-    }
-    let n = ids.len();
-    let mut rootname: Vec<u32> = (0..n as u32).collect(); // per root: index of min id
-    for i in 0..n as u32 {
-        let r = find(&mut parent, i);
-        if ids[i as usize] < ids[rootname[r as usize] as usize] {
-            rootname[r as usize] = i;
+        let mut person: Vec<(u64, &[u8])> = Vec::with_capacity(n);
+        for i in 0..n as u32 {
+            let r = find(&mut parent, i);
+            let nm = ids[rootname[r as usize] as usize];
+            person.push((xxh3_64(nm), nm));
         }
-    }
-    let mut person: Vec<(u64, &[u8])> = Vec::with_capacity(n);
-    for i in 0..n as u32 {
-        let r = find(&mut parent, i);
-        let nm = ids[rootname[r as usize] as usize];
-        person.push((xxh3_64(nm), nm));
-    }
-    let persons = Persons { map, person };
-    drop(pairs);
-    lap(&format!("links: {} ids", n));
+            Persons { map, person }
+    };
+    let parse_events = || {
+        // ---------- events: parse ----------
+        let ev_chunks = chunks(&ev_maps);
+        let ev_parts: Vec<Vec<Vec<Ev>>> = ev_chunks
+            .par_iter()
+            .fold(empty_buckets, |mut acc, ch| {
+                for l in lines(ch) {
+                    let mut f = [&b""[..]; 7];
+                    if !split_fields(l, &mut f) || f[0].is_empty() {
+                        continue;
+                    }
+                    let h = xxh3_128(f[0]);
+                    let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
+                    let mut typ = match f[4] {
+                        b"view" => 0u8,
+                        b"cart" => 1,
+                        b"purchase" => 2,
+                        _ => BAD,
+                    };
+                    let mut ts = 0;
+                    let mut price = 0;
+                    let mut cat = 0;
+                    if typ != BAD {
+                        if f[1].is_empty() || f[5].is_empty() {
+                            typ = BAD;
+                        } else {
+                            match parse_ts(f[2]) {
+                                Some(t) if t >= ws && t < we => {
+                                    ts = t;
+                                    if ingest.saturating_sub(t) > DAY {
+                                        typ = BAD;
+                                    } else if typ == 2 {
+                                        match parse_price(f[6]) {
+                                            Some(p) => {
+                                                price = p;
+                                                cat = products.get(f[5]).map(|c| c as u8).unwrap_or(unknown_cat);
+                                            }
+                                            None => typ = BAD,
+                                        }
+                                    }
+                                }
+                                _ => typ = BAD,
+                            }
+                        }
+                    }
+                    acc[(h >> 120) as usize].push(Ev {
+                        e0: (h >> 64) as u64,
+                        e1: h as u64,
+                        ingest,
+                        ts,
+                        uid: f[1],
+                        price,
+                        cat,
+                        typ,
+                    });
+                }
+                acc
+            })
+            .collect();
+            transpose(ev_parts)
+    };
+    let (persons, ev_b) = rayon::join(build_links, parse_events);
+    lap("links+ev_parse");
 
     // ---------- clicks ----------
     let ck_chunks = chunks(&ck_maps);
@@ -512,86 +571,54 @@ fn main() {
         })
         .collect();
     let ck_b = transpose(ck_parts);
-    lap("clicks parsed");
-
-    // ---------- events: parse ----------
-    let ev_chunks = chunks(&ev_maps);
-    let ev_parts: Vec<Vec<Vec<Ev>>> = ev_chunks
-        .par_iter()
-        .fold(empty_buckets, |mut acc, ch| {
-            for l in lines(ch) {
-                let mut f = [&b""[..]; 7];
-                if !split_fields(l, &mut f) || f[0].is_empty() {
-                    continue;
-                }
-                let h = xxh3_128(f[0]);
-                let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
-                let mut typ = match f[4] {
-                    b"view" => 0u8,
-                    b"cart" => 1,
-                    b"purchase" => 2,
-                    _ => BAD,
-                };
-                let mut ts = 0;
-                let mut price = 0;
-                let mut cat = 0;
-                if typ != BAD {
-                    if f[1].is_empty() || f[5].is_empty() {
-                        typ = BAD;
-                    } else {
-                        match parse_ts(f[2]) {
-                            Some(t) if t >= ws && t < we => {
-                                ts = t;
-                                if ingest.saturating_sub(t) > DAY {
-                                    typ = BAD;
-                                } else if typ == 2 {
-                                    match parse_price(f[6]) {
-                                        Some(p) => {
-                                            price = p;
-                                            cat = products.get(f[5]).map(|c| c as u8).unwrap_or(unknown_cat);
-                                        }
-                                        None => typ = BAD,
-                                    }
-                                }
-                            }
-                            _ => typ = BAD,
-                        }
-                    }
-                }
-                acc[(h >> 120) as usize].push(Ev {
-                    e0: (h >> 64) as u64,
-                    e1: h as u64,
-                    ingest,
-                    ts,
-                    uid: f[1],
-                    price,
-                    cat,
-                    typ,
-                });
-            }
-            acc
-        })
-        .collect();
-    let ev_b = transpose(ev_parts);
-    lap("events parsed");
+    lap("ck_parse");
 
     // ---------- events: dedup + resolve ----------
     let sv_parts: Vec<Vec<Vec<Sv>>> = ev_b
         .into_par_iter()
         .map(|vs| {
-            let mut v = concat(vs);
-            v.sort_unstable_by(|a, b| (a.e0, a.e1, a.ingest).cmp(&(b.e0, b.e1, b.ingest)));
+            // sort 16-byte keys (e0, location) instead of moving whole records
+            let total: usize = vs.iter().map(|v| v.len()).sum();
+            let mut keys: Vec<(u64, u64)> = Vec::with_capacity(total);
+            for (pi, part) in vs.iter().enumerate() {
+                for (ei, e) in part.iter().enumerate() {
+                    keys.push((e.e0, ((pi as u64) << 32) | ei as u64));
+                }
+            }
+            keys.sort_unstable_by_key(|k| k.0);
+            let at = |loc: u64| &vs[(loc >> 32) as usize][(loc & 0xffff_ffff) as usize];
             let mut out: Vec<Vec<Sv>> = empty_buckets();
+            macro_rules! emit {
+                ($e:expr) => {{
+                    let e: &Ev = $e;
+                    if e.typ != BAD {
+                        let (pkey, name) = persons.resolve(e.uid);
+                        out[(pkey >> 56) as usize].push(Sv { pkey, ts: e.ts, name, price: e.price, cat: e.cat, typ: e.typ });
+                    }
+                }};
+            }
+            let mut grp: Vec<&Ev> = vec![];
             let mut i = 0;
-            while i < v.len() {
-                let e = v[i];
+            while i < keys.len() {
                 let mut j = i + 1;
-                while j < v.len() && v[j].e0 == e.e0 && v[j].e1 == e.e1 {
+                while j < keys.len() && keys[j].0 == keys[i].0 {
                     j += 1;
                 }
-                if e.typ != BAD {
-                    let (pkey, name) = persons.resolve(e.uid);
-                    out[(pkey >> 56) as usize].push(Sv { pkey, ts: e.ts, name, price: e.price, cat: e.cat, typ: e.typ });
+                if j == i + 1 {
+                    emit!(at(keys[i].1));
+                } else {
+                    grp.clear();
+                    grp.extend(keys[i..j].iter().map(|k| at(k.1)));
+                    grp.sort_unstable_by_key(|e| (e.e1, e.ingest));
+                    let mut a = 0;
+                    while a < grp.len() {
+                        let mut b = a + 1;
+                        while b < grp.len() && grp[b].e1 == grp[a].e1 {
+                            b += 1;
+                        }
+                        emit!(grp[a]);
+                        a = b;
+                    }
                 }
                 i = j;
             }
@@ -599,13 +626,13 @@ fn main() {
         })
         .collect();
     let sv_b = transpose(sv_parts);
-    lap("events deduped");
+    lap("ev_dedup");
 
     // ---------- sessions ----------
     let nacc = (ncamp + 1) * ndays;
     let work: Vec<(Vec<Vec<Sv>>, Vec<Vec<Ck>>)> = sv_b.into_iter().zip(ck_b).collect();
     let results: Vec<(Vec<URow>, Vec<[i64; 4]>)> = work
-        .into_par_iter()
+        .into_par_iter().with_min_len((NB / ncpu).max(1))
         .fold(
             || (Vec::new(), vec![[0i64; 4]; nacc]),
             |(mut urows, mut acc), (svs, cks)| {
@@ -723,7 +750,7 @@ fn main() {
             },
         )
         .collect();
-    lap("sessions built");
+    lap("sessions");
 
     // merge campaign accumulators
     let mut acc = vec![[0i64; 4]; nacc];
@@ -736,6 +763,7 @@ fn main() {
         }
         ugroups.push(u);
     }
+    lap("merge");
 
     // ---------- output ----------
     let ud = outdir.join("user_daily");
@@ -759,6 +787,7 @@ fn main() {
             write_users(&ud.join(format!("part-{:05}.parquet", i)), rows, &catnames);
         }
     });
+    lap("users_out");
     let mut crows: Vec<(&[u8], &[u8], i32, [i64; 4])> = vec![];
     for c in 0..=ncamp {
         for d in 0..ndays {
@@ -771,6 +800,7 @@ fn main() {
     }
     write_campaigns(&cd.join("part-00000.parquet"), &crows);
     lap("done");
+    std::process::exit(0);
 }
 
 #[inline]
