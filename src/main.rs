@@ -376,6 +376,7 @@ fn main() {
     }));
     let outdir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
     let ncpu: usize = std::env::var("NCPU").ok().and_then(|x| x.parse().ok()).unwrap_or(8);
+    let use_radix = std::env::var("RADIX").map(|v| v != "0").unwrap_or(true);
     rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().unwrap();
     let lap = |s: &str| eprintln!("[{:>8.3}s] {}", t0.elapsed().as_secs_f64(), s);
 
@@ -585,7 +586,12 @@ fn main() {
                     keys.push((e.e0, ((pi as u64) << 32) | ei as u64));
                 }
             }
-            keys.sort_unstable_by_key(|k| k.0);
+            let low = |k: u64| k & ((1u64 << 33) - 1);
+            if use_radix {
+                radix33(&mut keys);
+            } else {
+                keys.sort_unstable_by_key(|k| low(k.0));
+            }
             let at = |loc: u64| &vs[(loc >> 32) as usize][(loc & 0xffff_ffff) as usize];
             let mut out: Vec<Vec<Sv>> = empty_buckets();
             macro_rules! emit {
@@ -601,7 +607,7 @@ fn main() {
             let mut i = 0;
             while i < keys.len() {
                 let mut j = i + 1;
-                while j < keys.len() && keys[j].0 == keys[i].0 {
+                while j < keys.len() && low(keys[j].0) == low(keys[i].0) {
                     j += 1;
                 }
                 if j == i + 1 {
@@ -609,11 +615,11 @@ fn main() {
                 } else {
                     grp.clear();
                     grp.extend(keys[i..j].iter().map(|k| at(k.1)));
-                    grp.sort_unstable_by_key(|e| (e.e1, e.ingest));
+                    grp.sort_unstable_by_key(|e| (e.e0, e.e1, e.ingest));
                     let mut a = 0;
                     while a < grp.len() {
                         let mut b = a + 1;
-                        while b < grp.len() && grp[b].e1 == grp[a].e1 {
+                        while b < grp.len() && grp[b].e0 == grp[a].e0 && grp[b].e1 == grp[a].e1 {
                             b += 1;
                         }
                         emit!(grp[a]);
@@ -638,8 +644,36 @@ fn main() {
             |(mut urows, mut acc), (svs, cks)| {
                 let mut ev = concat(svs);
                 let mut ck = concat(cks);
-                ev.sort_unstable_by_key(|s| (s.pkey, s.ts));
-                ck.sort_unstable_by(|a, b| a.pkey.cmp(&b.pkey).then(a.ts.cmp(&b.ts)).then(a.cid.cmp(b.cid)));
+                if use_radix && we - ws < (1i64 << 31) {
+                    // packed key: low 33 bits of pkey, then 31-bit window-relative ts
+                    const M33: u64 = (1u64 << 33) - 1;
+                    let mut keys: Vec<(u64, u64)> = ev
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (((s.pkey & M33) << 31) | (s.ts - ws) as u64, i as u64))
+                        .collect();
+                    radix_bits(&mut keys, 6);
+                    let mut sorted: Vec<Sv> = keys.iter().map(|k| ev[k.1 as usize]).collect();
+                    // runs sharing low-33 pkey bits but differing in full pkey: regroup (stable keeps ts order)
+                    let mut a = 0;
+                    while a < keys.len() {
+                        let hi33 = keys[a].0 >> 31;
+                        let mut b = a + 1;
+                        let mut mixed = false;
+                        while b < keys.len() && keys[b].0 >> 31 == hi33 {
+                            mixed |= sorted[b].pkey != sorted[a].pkey;
+                            b += 1;
+                        }
+                        if mixed {
+                            sorted[a..b].sort_by_key(|s| s.pkey);
+                        }
+                        a = b;
+                    }
+                    ev = sorted;
+                } else {
+                    ev.sort_unstable_by_key(|s| (pord(s.pkey), s.ts));
+                }
+                ck.sort_unstable_by(|a, b| pord(a.pkey).cmp(&pord(b.pkey)).then(a.ts.cmp(&b.ts)).then(a.cid.cmp(b.cid)));
                 let mut cnt = vec![0u32; ncamp];
                 let mut inlist = vec![false; ncamp];
                 let mut active: Vec<u32> = vec![];
@@ -652,7 +686,7 @@ fn main() {
                     while pe < ev.len() && ev[pe].pkey == pk {
                         pe += 1;
                     }
-                    while ci < ck.len() && ck[ci].pkey < pk {
+                    while ci < ck.len() && pord(ck[ci].pkey) < pord(pk) {
                         ci += 1;
                     }
                     let cs0 = ci;
@@ -883,4 +917,56 @@ fn write_campaigns(path: &Path, rows: &[(&[u8], &[u8], i32, [i64; 4])]) {
 #[inline]
 fn lines(d: &[u8]) -> Lines<'_> {
     Lines { d }
+}
+
+/// LSD radix sort of (key, payload) pairs on the low 33 bits of key (3 passes of 11 bits).
+/// Equal low-33 keys end up adjacent; callers compare full keys within such runs.
+fn radix33(a: &mut Vec<(u64, u64)>) {
+    radix_bits(a, 3)
+}
+
+/// LSD radix on the low 11*passes bits of key.
+fn radix_bits(a: &mut Vec<(u64, u64)>, passes: usize) {
+    const B: usize = 11;
+    const R: usize = 1 << B;
+    const M: u64 = (R - 1) as u64;
+    let n = a.len();
+    let mask = if passes * B >= 64 { u64::MAX } else { (1u64 << (passes * B)) - 1 };
+    if n < 256 {
+        a.sort_unstable_by_key(|k| k.0 & mask);
+        return;
+    }
+    let mut h = vec![[0u32; R]; passes];
+    for k in a.iter() {
+        for (p, hp) in h.iter_mut().enumerate() {
+            hp[((k.0 >> (p * B)) & M) as usize] += 1;
+        }
+    }
+    for hp in h.iter_mut() {
+        let mut sum = 0u32;
+        for c in hp.iter_mut() {
+            let t = *c;
+            *c = sum;
+            sum += t;
+        }
+    }
+    let mut buf: Vec<(u64, u64)> = Vec::with_capacity(n);
+    unsafe { buf.set_len(n) };
+    let (mut src, mut dst) = (std::mem::take(a), buf);
+    for (p, hp) in h.iter_mut().enumerate() {
+        let sh = p * B;
+        for k in src.iter() {
+            let d = ((k.0 >> sh) & M) as usize;
+            unsafe { *dst.get_unchecked_mut(hp[d] as usize) = *k };
+            hp[d] += 1;
+        }
+        std::mem::swap(&mut src, &mut dst);
+    }
+    *a = src;
+}
+
+/// Person order used by the session phase: low 33 bits first (radix key), full key to break ties.
+#[inline]
+fn pord(pk: u64) -> (u64, u64) {
+    (pk & ((1u64 << 33) - 1), pk)
 }
